@@ -2,7 +2,7 @@ import os
 import io
 import uuid
 from datetime import datetime
-from fastapi import FastAPI, UploadFile, File, Form
+from fastapi import FastAPI, UploadFile, File, Form, HTTPException, Response
 from fastapi.responses import FileResponse, Response
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
@@ -19,6 +19,8 @@ from fhir.resources.condition import Condition
 from fhir.resources.documentreference import DocumentReference
 from fhir.resources.codeableconcept import CodeableConcept
 from fhir.resources.coding import Coding
+
+from auth import hash_password, verify_password, create_access_token
 
 app = FastAPI(title="MediKiosk Backend Engine", version="1.0.0")
 
@@ -306,3 +308,69 @@ def get_patient_history(contact: str):
     # Sort by newest first
     history.sort(key=lambda x: x["created_at"], reverse=True)
     return {"history": history}
+
+# --- Authentication & Verification Schemas ---
+
+class DoctorRegisterSchema(BaseModel):
+    full_name: str
+    email: str
+    password: str
+    license_number: str
+    specialization: str
+    hospital_name: str
+
+class LoginSchema(BaseModel):
+    email: str
+    password: str
+
+# In-Memory Database for Doctors
+doctors_db = []
+
+# --- Authentication & Admin Endpoints ---
+
+@app.post("/api/auth/register-doctor")
+def register_doctor(doctor: DoctorRegisterSchema):
+    for d in doctors_db:
+        if d["email"] == doctor.email:
+            raise HTTPException(status_code=400, detail="Email already registered")
+    
+    new_doctor = {
+        "id": len(doctors_db) + 1,
+        "full_name": doctor.full_name,
+        "email": doctor.email,
+        "hashed_password": hash_password(doctor.password),
+        "license_number": doctor.license_number,
+        "specialization": doctor.specialization,
+        "hospital_name": doctor.hospital_name,
+        "is_verified": False,
+        "role": "doctor"
+    }
+    doctors_db.append(new_doctor)
+    return {"message": "Application submitted! Awaiting hospital admin approval."}
+
+@app.post("/api/auth/login")
+def login(credentials: LoginSchema):
+    doctor = next((d for d in doctors_db if d["email"] == credentials.email), None)
+    if not doctor or not verify_password(credentials.password, doctor["hashed_password"]):
+        raise HTTPException(status_code=401, detail="Invalid email or password")
+    
+    if not doctor["is_verified"]:
+        raise HTTPException(
+            status_code=403, 
+            detail="Account pending verification. Your credentials are under admin review."
+        )
+    
+    token = create_access_token({"sub": doctor["email"], "role": doctor["role"], "id": doctor["id"]})
+    return {"access_token": token, "token_type": "bearer", "doctor": doctor}
+
+@app.get("/api/admin/pending-doctors")
+def get_pending_doctors():
+    return [d for d in doctors_db if not d["is_verified"]]
+
+@app.post("/api/admin/verify-doctor/{doctor_id}")
+def verify_doctor(doctor_id: int):
+    for d in doctors_db:
+        if d["id"] == doctor_id:
+            d["is_verified"] = True
+            return {"message": f"Doctor {d['full_name']} verified successfully."}
+    raise HTTPException(status_code=404, detail="Doctor not found")
